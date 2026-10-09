@@ -1,0 +1,8 @@
+# Install into an existing external environment with the matching backend wheel.
+torch>=2.8
+torchvision>=0.23
+numpy>=1.26
+matplotlib>=3.9
+Pillow>=10
+pytest>=8
+# Ascend: torch-npu must match torch; the qualified stack uses CANN 8.5.
