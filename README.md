@@ -1,92 +1,100 @@
 # SAW Implementation
 
-Reference implementation of **SAW** (Server-Side Age-weighted Aggregation for asynchronous federated learning) together with the asynchronous baselines used in the paper: FedAsync, FedBuff, CA2FL, CASA, FADAS, AdaMasFL, plus the SAW cache-weighting ablations (`SAW_EqualW`, `SAW_AdaInside`, Arrival-Frozen-Cache, FreshTopK, Power, Exp).
+Reference implementation of **Staleness-Aware Weighting (SAW)** for *Staleness-Aware Aggregation with Repeated Update Reuse in Asynchronous Federated Learning*.
 
-SAW aggregates the valid update cache on the server using harmonic weights normalized by current total model age; clients run plain local SGD. The implementation supports NVIDIA GPUs and Ascend NPUs through device abstraction, with persistent client caches on CPU by default (`--cache_device device` keeps the device-resident variant).
+At each server commit, SAW replaces the arriving clients' cache entries and recomputes normalized inverse-current-age weights over all valid entries. The age includes both pre-insertion delay and cache residence. Clients use ordinary local SGD. The implementation supports NVIDIA GPUs and Ascend NPUs, with persistent client caches on CPU by default.
 
-## Repository layout
+## Layout
 
+```text
+code/
+  algorithm/    SAW, seven asynchronous baselines, and cache ablations
+  models/       local optimization, ResNet, and CNN models
+  builders/     dataset and model construction
+  data_reader/  FEMNIST and GSpeech readers
+  utils/        arguments, sampling, aggregation, and result validation
+  tools/        dataset preparation and experiment definitions
+  scripts/      FEMNIST preparation
+  tests/        algorithm, runtime, preparation, and collection tests
 ```
-algorithm/    server aggregation rules (SAW + baselines + cache ablations)
-models/       ResNet and CNN models, client local update
-builders/     dataset and model construction
-data_reader/  FEMNIST and GSpeech readers
-utils/        sampling, aggregation, CPU state-dict cache, validation helpers
-tools/        dataset preparation (FEMNIST, GSpeech) and grid generator
-tests/        unit and runtime-contract tests
-```
 
-## Installation
+Datasets, results, logs, checkpoints, and environments belong outside this repository. The paper and private historical evidence are maintained separately from this public implementation.
 
-Python >= 3.10 is required. Install into an external environment that already has the matching backend wheel:
+## Environment
+
+Use Python >= 3.10 and an external environment containing a matching backend wheel. From the repository root:
 
 ```bash
-pip install -r requirements.txt
+pip install -r code/requirements.txt
 ```
 
-- NVIDIA GPU: torch >= 2.8 with CUDA.
-- Ascend NPU: install torch-npu matching torch; the qualified stack uses CANN 8.5.
+NVIDIA execution requires a compatible torch/CUDA installation. The qualified Ascend stack uses torch/torch-npu 2.9 and CANN 8.5. Activate the backend environment before launching a run. CANN may create compilation caches relative to the working directory, so run training from an external attempt directory.
 
-Datasets live outside the repository. Set `SAW_DATA_ROOT` to your dataset cache (default `~/SAW-data`); runtime outputs default to `SAW_STATE_ROOT` (default `~/.local/state/SAW-Implementation`).
-
-## Dataset preparation
+## Data preparation
 
 ```bash
 export SAW_DATA_ROOT="$HOME/SAW-data"
-bash code/scripts/prepare_femnist_full.sh          # full FEMNIST via LEAF
-python code/tools/prepare_femnist_truncated.py   # 1000-client subset
-python code/tools/convert_femnist_to_pt.py       # .pt cache for fast loading
-python code/tools/prepare_gspeech.py --download  # Google Speech Commands v2
+export SAW_STATE_ROOT="$HOME/.local/state/SAW-Implementation"
+bash code/scripts/prepare_femnist_full.sh
+python code/tools/prepare_femnist_truncated.py --num-users 1000
+python code/tools/convert_femnist_to_pt.py
+python code/tools/prepare_gspeech.py --download
 ```
 
-CIFAR-10/100 and TinyImageNet are downloaded automatically by torchvision into `SAW_DATA_ROOT`.
+FEMNIST uses writer partitions; GSpeech uses speaker partitions. Vision benchmarks use Dirichlet label partitions. The paper denotes their concentration by `alpha_Dir`; the compatible CLI argument remains `--alpha`. Dataset preparation defaults to `SAW_DATA_ROOT` or `~/SAW-data`; set the variable explicitly when reusing an existing cache.
 
-## Single training run
+## Single run
+
+Start from the repository root and use a new output directory for every attempt:
 
 ```bash
-RUN_DIR="$SAW_STATE_ROOT/runs/active/seed=1"
+export SAW_CODE_ROOT="$(pwd)"
+export SAW_DATA_ROOT="$HOME/SAW-data"
+export SAW_STATE_ROOT="$HOME/.local/state/SAW-Implementation"
+export PYTHONDONTWRITEBYTECODE=1
+RUN_DIR="$SAW_STATE_ROOT/runs/active/cifar-a01-m100-mc40-b5/SAW/seed=1/attempt=1"
 mkdir -p "$RUN_DIR"
 cd "$RUN_DIR"
-python "$SAW_CODE_ROOT/code/main_fed.py" --algo SAW --dataset cifar --distribution noniid \
+python "$SAW_CODE_ROOT/code/main_fed.py" \
+  --algo SAW --dataset cifar --model resnet --distribution noniid \
   --alpha 0.1 --num_users 100 --concurrency 40 --buffer_size 5 \
-  --seed 1 --total_rounds 500 --local_period 10 --random_cost pareto \
-  --data_dir "$SAW_DATA_ROOT" --cache_device cpu --gpu 0 \
-  --output_dir "$RUN_DIR" --system_metrics_log_dir "$RUN_DIR/metrics"
+  --seed 1 --total_rounds 500 --interval 1 \
+  --local_period 10 --local_epochs 0 --local_bs 100 --lr 0.01 \
+  --random_cost pareto --data_dir "$SAW_DATA_ROOT" \
+  --cache_device cpu --gpu 0 \
+  --output_dir "$RUN_DIR/accuracy" --system_metrics_log_dir "$RUN_DIR/metrics"
 ```
 
-Notes:
+`--gpu -1` selects CPU. `--cache_device device` retains device-resident persistent caches. Accuracy outputs are exclusively reserved, and each run records its actual arguments, source identity, working directory, and terminal status in paired metadata. Reusing an existing output is rejected.
 
-- `--algo` selects the method (see `code/algorithm/`).
-- On Ascend, activate the qualified CANN environment first; CANN writes compilation caches relative to the process working directory, so launch from an external task directory.
-- `--gpu -1` runs on CPU.
-- Every run exclusively creates its accuracy, metrics, resolved-config and identity files; rerunning the same output directory is rejected. Each run records its Git source identity, actual command, working directory and exit status in a paired `*-identity.json`.
+## Paper protocol and interpretation
 
-## Result collection
+The manuscript evaluates eight methods: SAW, FedAsync, FedBuff, CA2FL, MA-Light (`FedBuffMALight`), CASA, FADAS, and AdaMasFL. Datasets are CIFAR-10, CIFAR-100, TinyImageNet, FEMNIST, and Google Speech Commands v2. Vision partitions use `alpha_Dir` in `{0.1, 0.5}`. The six `(M, Mc, b)` settings are `(100,30,5)`, `(100,40,5)`, `(100,60,10)`, `(100,80,10)`, `(50,30,5)`, and `(50,40,5)`, with seeds 1 through 5 and 500 server commits.
+
+`--random_cost pareto` samples `10 * numpy.random.pareto(2)`, a Lomax/Pareto-II service duration with scale 10 and shape 2, supported on nonnegative simulated time. Service duration and model-version age are distinct quantities. The local-period default is 10 mini-batch steps. A positive `--local_epochs` changes the local SGD loop length. AdaMasFL's hyperparameter formulas and server normalization still use `--local_period`; reproduce its paper protocol with `--local_period 10 --local_epochs 0`. The current manuscript explicitly specifies ten steps for vision tasks and for AdaMasFL on every task. Historical FEMNIST/GSpeech settings for other methods require their original run configurations; parser defaults alone do not reconstruct those runs.
+
+The paper reports batch sizes of 100 for vision, 35 for FEMNIST, and 20 for GSpeech, with client learning rates of 0.01 for vision/FEMNIST and 0.1 for GSpeech. The CLI defaults to batch 100 and learning rate 0.01 across datasets: explicitly pass `--local_bs 35 --lr 0.01` for FEMNIST and `--local_bs 20 --lr 0.1` for GSpeech. Method-specific overrides apply separately. FADAS vision runs use local/server rates 0.1/0.0001 and disable the optional delay-adaptive switch. AdaMasFL uses its published formulas with ten local steps and 500 commits. Changing buffer size at a fixed commit horizon changes the completed-update count `K*b`.
+
+Cache ablations include buffer-only weighting (`SAW_AdaInside`), arrival-frozen weighting (`ArrivalFrozenCache`), freshest-five selection, power/exponential decay, and SAW. `SAW_UniformCache` supports full-cache uniform weighting; `SAW_EqualW` is a separate implementation. The current manuscript's reported ablation table does not contain a matched full-cache uniform-weight result. The included `plot_ablation_60_10.py` targets a separate CIFAR-100 ablation and is not the plotting entrypoint for the manuscript's CIFAR-10 figure.
+
+Tail-10 means the final ten evaluations within each run. Report the sample standard deviation across seeds separately from confidence intervals or training-process variability. Small-model tests establish their stated contracts; they do not establish convergence, wall-clock acceleration, or complete historical protocol equivalence.
+
+## Collection and tests
+
+From the repository root:
 
 ```bash
-python code/gather.py --source "$SAW_STATE_ROOT/runs/active" --output-dir "$SAW_STATE_ROOT/runs/awaiting_review" --total-rounds 500        # dry-run
-python code/gather.py --source "$SAW_STATE_ROOT/runs/active" --output-dir "$SAW_STATE_ROOT/runs/awaiting_review" --total-rounds 500 --copy
+python code/gather.py --source "$SAW_STATE_ROOT/runs/active" \
+  --output-dir "$SAW_STATE_ROOT/runs/awaiting_review" --total-rounds 500
 ```
 
-The collector requires paired accuracy / system metrics / resolved config / identity per attempt, validates configured rounds, and refuses repository-local or overlapping destinations. `organize_completed_results.py` shares the same contract with `--sources ... --target-root ...`.
-
-## Tests
+This previews collection. Add `--copy` to preserve the paired accuracy, metrics, configuration, and identity in a review directory. The collector refuses overlapping or repository-local destinations and checks the configured final round. Formal verification also requires terminal-state evidence and a result audit.
 
 ```bash
 cd code
 python -m pytest tests -q
 ```
 
-The suite covers runtime contracts (exclusive output reservation, identity lifecycle, collector pairing), algorithm recurrence on small models, dataset preparation paths and result validation. Tests that need a GPU/NPU skip automatically on CPU-only hosts.
-
-## Method summary
-
-- **SAW**: server-side harmonic re-weighting of the update cache by current total age; freshest cached updates dominate.
-- **Cache ablations**: equal weights, inside-only weighting, arrival-time frozen weights, top-K freshest, power and exponential kernels.
-- **Baselines**: FedAsync (staleness-weighted Polyak averaging), FedBuff, CA2FL, CASA, FADAS, AdaMasFL.
-
-Training uses Pareto-distributed response costs by default (`--random_cost pareto`); staleness functions follow each method's original formulation.
-
 ## License
 
-Released under the MIT License; see [LICENSE](LICENSE). Baseline methods follow their original publications; LEAF (FEMNIST) and Google Speech Commands datasets keep their respective licenses and are prepared, not redistributed, by the tools above.
+MIT; see [LICENSE](LICENSE). Baseline implementations follow their respective publications. LEAF/FEMNIST and Google Speech Commands retain their dataset licenses and are prepared rather than redistributed by this repository.
